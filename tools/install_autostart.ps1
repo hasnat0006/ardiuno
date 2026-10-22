@@ -33,7 +33,7 @@ $settings = New-ScheduledTaskSettingsSet `
     -MultipleInstances IgnoreNew
 
 Register-ScheduledTask -TaskName $TaskName -Action $action -Trigger $trigger -Settings $settings `
-    -Description "Sends time, Claude session status and usage to the Arduino OLED." -Force | Out-Null
+    -Description "Sends time, Claude session status and usage to the ESP32 OLED over WiFi." -Force | Out-Null
 Start-ScheduledTask -TaskName $TaskName
 
 Write-Output "Installed '$TaskName': it is running now and will start at every login."

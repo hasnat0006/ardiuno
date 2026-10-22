@@ -1,8 +1,11 @@
-"""Link between this PC and the Arduino OLED: time, Claude activity and usage.
+"""Link between this PC and the ESP32 OLED: time, Claude activity and usage.
 
-Sends over USB serial:
-  T<unix seconds>                                   local time, every 10 s
-  C<working>,<5h %>,<week %>,<5h reset min>,<week reset min>   every 2 s
+Sends UDP packets over WiFi to port 4210 of the ESP32:
+  T<unix seconds>,<checksum>                        local time, every 10 s
+  C<working>,<5h %>,<week %>,<5h reset min>,<week reset min>,<checksum>   every 2 s
+
+<checksum> is the sum of the line's characters before it, mod 256; the OLED
+ignores lines that don't add up.
 
 <working> counts the Claude Code sessions busy on a reply right now. Each
 session keeps ~/.claude/sessions/<pid>.json up to date with a "status" of
@@ -17,19 +20,22 @@ nor that endpoint are an official API, so a future Claude Code update could
 change them.
 
 Usage:
-    pip install pyserial
-    python tools/pc_link.py            # auto-detects the Arduino
-    python tools/pc_link.py --port COM5
+    python tools/pc_link.py                      # finds the ESP32 as claude-oled.local
+    python tools/pc_link.py --host 192.168.1.42  # or send to a fixed IP
 
-Stop it (Ctrl+C) before uploading new firmware: it holds the serial port.
+The ESP32 answers to claude-oled.local (mDNS, built into Windows 10/11), so
+its IP can change freely. The OLED shows its IP until the first time sync
+arrives.
 
 To run it all the time in the background, see tools/install_autostart.ps1.
 When started without a console (pythonw), messages go to tools/pc_link.log.
 """
 
 import argparse
+import asyncio
 import ctypes
 import json
+import socket
 import sys
 import time
 import traceback
@@ -38,20 +44,17 @@ import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
 
-import serial
-import serial.tools.list_ports
+ESP32_HOST = "claude-oled.local"  # the ESP32's mDNS name (HOSTNAME in src/main.cpp)
+LINK_PORT = 4210   # UDP port the ESP32 listens on (LINK_PORT in src/main.cpp)
 
 TIME_EVERY = 10    # seconds between time syncs
 STATUS_EVERY = 2   # seconds between Claude status updates
-USAGE_EVERY = 180  # seconds between usage checks (every 60 s got HTTP 429 errors)
+USAGE_EVERY = 180  # seconds between usage checks
 LOGIN_CHECK_EVERY = 30  # while the login is expired, re-read the (local) credentials file this often
 BACKOFF_MAX = 1800      # longest wait after repeated HTTP 429 errors
 
 CLAUDE_DIR = Path.home() / ".claude"
 USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
-
-# USB vendor IDs of common Arduino boards and USB-serial chips
-ARDUINO_VIDS = {0x2341, 0x2A03, 0x1A86, 0x0403, 0x10C4}
 
 kernel32 = ctypes.windll.kernel32
 PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
@@ -114,41 +117,89 @@ def fetch_usage():
             minutes_until(five.get("resets_at")), minutes_until(week.get("resets_at")))
 
 
-def find_port():
-    for p in serial.tools.list_ports.comports():
-        if p.vid in ARDUINO_VIDS:
-            return p.device
-    return None
-
-
-def open_serial(port_arg):
-    while True:
-        port = port_arg or find_port()
-        if port:
-            try:
-                ser = serial.Serial(port, 115200, timeout=0)
-                print(f"Connected to {port}")
-                time.sleep(2)  # opening the port resets the Arduino
-                return ser
-            except serial.SerialException as e:
-                print(f"Can't open {port}: {e}")
-        else:
-            print("Arduino not found, retrying...")
-        time.sleep(2)
-
-
 def local_unix_time():
     """Seconds since 1970 in local time (the Arduino doesn't know time zones)."""
     now = time.time()
     return int(now + time.localtime(now).tm_gmtoff)
 
 
-def main():
+def with_checksum(line):
+    """Adds ",<sum of the characters mod 256>": the ESP32 drops lines garbled on the way."""
+    return f"{line},{sum(line.encode()) % 256}"
+
+
+class LinkDown(Exception):
+    """Sending failed; the link reconnects before the next message."""
+
+
+class UdpLink:
+    """The ESP32, as UDP packets over WiFi."""
+
+    def __init__(self, host):
+        self.host = host
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+        self.targets, self.targets_at = [], 0.0
+
+    @staticmethod
+    def broadcast_addresses():
+        """With several network adapters (WSL, Hyper-V, VPN), Windows sends 255.255.255.255
+        out of only one of them, often the wrong one. So also send to each local network's
+        own broadcast address (assuming the usual /24, e.g. 192.168.0.255), which Windows
+        routes out of the right adapter."""
+        try:
+            ips = {a[4][0] for a in socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET)}
+        except OSError:
+            ips = set()
+        nets = {ip.rsplit(".", 1)[0] + ".255" for ip in ips if not ip.startswith(("127.", "169.254."))}
+        return ["255.255.255.255"] + sorted(nets)
+
+    def find_targets(self):
+        """Looks the ESP32 up by name (it answers to claude-oled.local over mDNS). If that
+        fails, keeps the last address that worked; with none yet, broadcasts, which only
+        reaches it if the router passes broadcasts on to WiFi devices (many don't)."""
+        if self.host == "255.255.255.255":
+            return self.broadcast_addresses()
+        try:
+            return [socket.gethostbyname(self.host)]
+        except OSError:
+            return self.targets or self.broadcast_addresses()
+
+    async def current_targets(self):
+        if time.time() - self.targets_at > 60:  # recheck every minute: its IP can change
+            targets = await asyncio.to_thread(self.find_targets)  # a failed lookup takes seconds
+            if targets != self.targets:
+                print(f"{time.strftime('%H:%M:%S')} sending to {', '.join(targets)}")
+            self.targets, self.targets_at = targets, time.time()
+        return self.targets
+
+    async def connect(self):
+        print(f"Sending to {self.host}:{LINK_PORT} over UDP")
+
+    async def send(self, data):
+        sent, error = 0, None
+        for target in await self.current_targets():
+            try:
+                self.sock.sendto(data, (target, LINK_PORT))
+                sent += 1
+            except OSError as e:  # e.g. that adapter is down
+                error = e
+        if not sent:  # no network at all (WiFi off, PC just woke up)
+            raise LinkDown(error)
+
+    async def reconnect(self):
+        pass  # nothing to reconnect: the next send simply tries again
+
+
+async def main():
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("--port", help="serial port, e.g. COM5 (default: auto-detect)")
+    parser.add_argument("--host", default=ESP32_HOST,
+                        help=f"the ESP32's name or IP address, or 255.255.255.255 to broadcast (default: {ESP32_HOST})")
     args = parser.parse_args()
 
-    ser = open_serial(args.port)
+    link = UdpLink(args.host)
+    await link.connect()
+    send_problem = None  # last send error logged, so a repeating one is only logged once
     last_time = next_usage = 0.0
     usage = None  # (5h %, week %, 5h reset min, week reset min), fetched at time `usage_at`
     usage_at = 0.0
@@ -157,8 +208,8 @@ def main():
     last_working = None
 
     while True:
-        # Wake at the start of each second so the Arduino's seconds tick in step
-        time.sleep(1 - time.time() % 1)
+        # Wake at the start of each second so the OLED's seconds tick in step
+        await asyncio.sleep(1 - time.time() % 1)
         now = time.time()
         lines = []
 
@@ -176,7 +227,7 @@ def main():
                 next_usage = now + USAGE_EVERY
                 problem = None
                 try:
-                    usage = fetch_usage()
+                    usage = await asyncio.to_thread(fetch_usage)
                     usage_at = now
                     backoff = USAGE_EVERY
                     print(f"{time.strftime('%H:%M:%S')} usage: 5h {usage[0]}%, week {usage[1]}%")
@@ -216,14 +267,17 @@ def main():
                 five_min = week_min = 0
             lines.append(f"C{working},{five},{week},{five_min},{week_min}")
 
+        if not lines:
+            continue
         try:
-            for line in lines:
-                ser.write((line + "\n").encode())
-        except serial.SerialException:
-            print("Lost connection, reconnecting...")
-            ser.close()
-            ser = open_serial(args.port)
-            last_time = 0
+            await link.send("".join(with_checksum(line) + "\n" for line in lines).encode())
+            send_problem = None
+        except LinkDown as e:  # network down: keep trying
+            if str(e) != send_problem:
+                print(f"{time.strftime('%H:%M:%S')} lost the link: {e}")
+                send_problem = str(e)
+            await link.reconnect()
+            last_time = 0  # resend the time as soon as the link is back
 
 
 def log_to_file_if_hidden():
@@ -239,7 +293,7 @@ if __name__ == "__main__":
     log_to_file_if_hidden()
     while True:
         try:
-            main()
+            asyncio.run(main())
         except KeyboardInterrupt:
             break
         except Exception:  # never give up when running unattended: log it and start over

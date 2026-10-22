@@ -1,10 +1,14 @@
 #include <Arduino.h>
 #include <Wire.h>
+#include <WiFi.h>
+#include <WiFiUdp.h>
+#include <ESPmDNS.h>
 #include <U8g2lib.h>
+#include "wifi_secrets.h"  // WIFI_SSID and WIFI_PASSWORD (copy wifi_secrets.example.h)
 
 // OLED desk companion: big animated clock, expressive eyes, and a Claude mode.
 //
-// tools/pc_link.py on the PC sends:
+// tools/pc_link.py on one or more PCs sends, as UDP packets over WiFi (or over USB serial):
 //   "T<unix seconds>"                                   local time, every 10 s
 //   "C<working>,<5h %>,<week %>,<5h reset min>,<week reset min>"   every 2 s
 //   (<working> = Claude Code sessions busy on a reply right now)
@@ -12,16 +16,15 @@
 // Claude not working:  eyes -> time -> eyes -> time ...
 // Claude working:      Claude animation -> usage -> Claude animation -> time ...
 //
-// Wiring (Arduino Uno / Nano):
-//   OLED:  VCC->5V, GND->GND, SDA->A4, SCL->A5
+// Wiring (ESP32-WROOM-32 DevKit):
+//   OLED:  VCC->3V3, GND->GND, SDA->GPIO21, SCL->GPIO22
 //
 // If the image is shifted or garbled, use the SSD1306 constructor instead:
-//   U8G2_SSD1306_128X64_NONAME_2_HW_I2C display(U8G2_R0, U8X8_PIN_NONE);
-//
-// Page mode ("_2"): the screen is drawn in 4 strips through a 256-byte buffer
-// instead of a full 1 KB one, which leaves the Uno enough RAM to run safely.
-// So each frame's logic runs once in update(), and render() only draws.
-U8G2_SH1106_128X64_NONAME_2_HW_I2C display(U8G2_R0, U8X8_PIN_NONE);
+//   U8G2_SSD1306_128X64_NONAME_F_HW_I2C display(U8G2_R0, U8X8_PIN_NONE);
+U8G2_SH1106_128X64_NONAME_F_HW_I2C display(U8G2_R0, U8X8_PIN_NONE);
+
+const char *HOSTNAME = "claude-oled";  // the PC finds it as claude-oled.local (HOST in pc_link.py)
+const uint16_t LINK_PORT = 4210;       // UDP port pc_link.py sends to
 
 // 400 kHz gives smooth animation. If the screen flickers or blanks out
 // (loose wiring), drop this to 100000.
@@ -52,7 +55,6 @@ uint32_t syncUnix = 0;        // local time (seconds since 1970) at last sync
 unsigned long syncMillis = 0; // millis() at last sync
 bool synced = false;
 
-// millis() captured once per frame, so every strip of a frame shows the same moment
 unsigned long frameNow = 0;
 
 uint32_t nowUnix() { return syncUnix + (frameNow - syncMillis) / 1000; }
@@ -79,17 +81,56 @@ Date toDate(uint32_t t) {
 }
 
 // ---------------------------------------------------------------------------
-// Serial from the PC
+// Messages from the PC (WiFi or USB serial)
 // ---------------------------------------------------------------------------
-uint8_t claudeBusy = 0;  // Claude Code sessions busy on a reply
+// Several PCs can each run pc_link.py. Each sender (by IP; USB serial is 0) gets
+// a slot, Claude counts as working if any of them is, and the usage page shows
+// a working sender's numbers.
+struct Sender {
+  uint32_t ip;
+  unsigned long msgAt;  // millis() of its last C line; 0 = slot free
+  uint8_t busy, fivePct, weekPct;
+  uint16_t fiveResetMin, weekResetMin;
+};
+const uint8_t MAX_SENDERS = 4;
+Sender senders[MAX_SENDERS];
+
+bool fresh(const Sender &s) { return s.msgAt && millis() - s.msgAt < CLAUDE_TIMEOUT_MS; }
+
+// The slot for this sender: its own, else a free or timed-out one, else the oldest
+Sender &senderSlot(uint32_t ip) {
+  Sender *pick = &senders[0];
+  for (Sender &s : senders) if (s.msgAt && s.ip == ip) return s;
+  for (Sender &s : senders) {
+    if (!fresh(s)) return s;
+    if (s.msgAt < pick->msgAt) pick = &s;
+  }
+  return *pick;
+}
+
+// What the pages show, combined from all senders by combineSenders()
+uint8_t claudeBusy = 0;  // Claude Code sessions busy on a reply, on all PCs together
 uint8_t fivePct = 0xFF, weekPct = 0xFF;  // 0xFF = not known yet
 uint16_t fiveResetMin = 0, weekResetMin = 0;
-unsigned long claudeMsgAt = 0;
 
-bool claudeWorking() { return claudeBusy > 0 && millis() - claudeMsgAt < CLAUDE_TIMEOUT_MS; }
+bool claudeWorking() { return claudeBusy > 0; }
 
-char line[24];
-uint8_t lineLen = 0;
+void combineSenders() {
+  claudeBusy = 0;
+  const Sender *usage = nullptr;  // prefer a busy sender, then one that knows its usage
+  int best = -1;
+  for (const Sender &s : senders) {
+    if (!fresh(s)) continue;
+    claudeBusy = min(255, claudeBusy + s.busy);
+    int score = (s.busy > 0) * 2 + (s.fivePct <= 100);
+    if (score > best) best = score, usage = &s;
+  }
+  if (!usage) return;
+  fivePct = usage->fivePct;
+  weekPct = usage->weekPct;
+  fiveResetMin = usage->fiveResetMin;
+  weekResetMin = usage->weekResetMin;
+}
 
 // Reads digits up to the next comma (or the end) and moves past it
 uint32_t nextNumber(char *&p) {
@@ -99,32 +140,88 @@ uint32_t nextNumber(char *&p) {
   return v;
 }
 
-void handleLine() {
+// A line is T or C, then digits and commas, then ",<checksum>": the sum of every
+// character before that last comma, mod 256. Lines that don't add up are ignored.
+void handleLine(char *line, uint32_t from) {
+  if (line[0] != 'T' && line[0] != 'C') return;
+  char *last = nullptr;
+  for (char *q = line + 1; *q; q++) {
+    if (*q == ',') last = q;
+    else if (*q < '0' || *q > '9') return;
+  }
+  if (!last || !last[1]) return;
+  uint8_t sum = 0;
+  for (char *q = line; q < last; q++) sum += *q;
+  char *s = last + 1;
+  if (nextNumber(s) != sum) return;
+  *last = 0;
+
   char *p = line + 1;
   if (line[0] == 'T') {
-    syncUnix = nextNumber(p);
+    uint32_t t = nextNumber(p);
+    if (t < 1600000000UL) return;  // before 2020: not a real time
+    syncUnix = t;
     syncMillis = millis();
+    if (!synced) Serial.println(F("time synced from PC"));
     synced = true;
   } else if (line[0] == 'C') {
-    claudeBusy = nextNumber(p);
-    fivePct = nextNumber(p);
-    weekPct = nextNumber(p);
-    fiveResetMin = nextNumber(p);
-    weekResetMin = nextNumber(p);
-    claudeMsgAt = millis();
+    Sender &s = senderSlot(from);
+    s.ip = from;
+    s.busy = nextNumber(p);
+    s.fivePct = nextNumber(p);
+    s.weekPct = nextNumber(p);
+    s.fiveResetMin = nextNumber(p);
+    s.weekResetMin = nextNumber(p);
+    s.msgAt = millis() | 1;  // never 0, which means "free"
   }
 }
 
-void readSerial() {
-  while (Serial.available()) {
-    char c = Serial.read();
-    if (c == '\n') {
-      line[lineLen] = 0;
-      handleLine();
-      lineLen = 0;
-    } else if (c != '\r' && lineLen < sizeof(line) - 1) {
-      line[lineLen++] = c;
-    }
+// Collects characters into lines; WiFi and serial each get their own
+struct LineBuf { char s[32]; uint8_t len; };
+LineBuf serialLine, wifiLine;
+
+void feed(LineBuf &b, char c, uint32_t from) {
+  if (c == '\n') {
+    b.s[b.len] = 0;
+    handleLine(b.s, from);
+    b.len = 0;
+  } else if (c != '\r' && b.len < sizeof(b.s) - 1) {
+    b.s[b.len++] = c;
+  }
+}
+
+WiFiUDP udp;
+bool udpOpen = false;
+
+void startWifi() {
+  WiFi.mode(WIFI_STA);
+  WiFi.setHostname(HOSTNAME);
+  WiFi.setAutoReconnect(true);
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  WiFi.setSleep(false);  // WiFi power saving delays (or drops) broadcast packets
+}
+
+void readMessages() {
+  combineSenders();  // also drops PCs that went quiet, even if nothing arrives now
+  while (Serial.available()) feed(serialLine, Serial.read(), 0);
+
+  if (WiFi.status() != WL_CONNECTED) return;
+  if (!udpOpen) {
+    udpOpen = udp.begin(LINK_PORT);
+    // Answer to "claude-oled.local", so the PC can find this IP by name: many routers
+    // don't pass broadcasts on to WiFi devices
+    MDNS.begin(HOSTNAME);
+    Serial.print(F("WiFi connected, IP "));
+    Serial.print(WiFi.localIP());
+    Serial.print(F(", name "));
+    Serial.print(HOSTNAME);
+    Serial.println(F(".local"));
+  }
+  while (udp.parsePacket() > 0) {
+    uint32_t from = udp.remoteIP();
+    int c;
+    while ((c = udp.read()) >= 0) feed(wifiLine, c, from);
+    wifiLine.len = 0;  // a line never spans two packets
   }
 }
 
@@ -160,7 +257,6 @@ void drawDigitAt(uint8_t x, int16_t baseline, uint8_t w, uint8_t v) {
 void drawSlot(uint8_t i, uint8_t x, uint8_t baseline, uint8_t w, uint8_t h) {
   Slot &s = slots[i];
   unsigned long t = frameNow - s.changed;
-  // Clip only vertically: digits roll up and down, never sideways
   display.setClipWindow(0, baseline - h - 1, 128, baseline + 1);
   if (t >= ROLL_MS) {
     drawDigitAt(x, baseline, w, s.val);
@@ -239,7 +335,6 @@ void drawClock() {
     }
   }
 
-  // Seconds in the smaller font
   display.setFont(MID_FONT);
   drawSlot(4, secX, secBase, secW, secH);
   drawSlot(5, secX + secW, secBase, secW, secH);
@@ -456,24 +551,25 @@ float rayLength(uint8_t i) { return pgm_read_byte(&RAY_LENGTH[i]) / 100.0; }
 
 // A tapered shape from distance r0 to r1 out from the centre, half-width hw0 at
 // the inner end and hw1 at the outer end, with an optional round tip.
-// Worked out once per frame (prepare...) and drawn for every strip (drawRays).
 struct Ray { int16_t bx, by, tx, ty; int8_t px, py, qx, qy; uint8_t tipR; };
 const uint8_t MAX_RAYS = 16;
 Ray rays[MAX_RAYS];
 uint8_t rayCount;
+float raySX = 1, raySY = 1;  // squash/stretch around each shape's centre (FLIP, BOUNCE)
 
 void addRay(float cx, float cy, float a, float r0, float r1, float hw0, float hw1, uint8_t tipR) {
   if (rayCount >= MAX_RAYS) return;
-  float dx = cos(a), dy = sin(a);
+  float dx = cos(a) * raySX, dy = sin(a) * raySY;
+  float nx = -sin(a) * raySX, ny = cos(a) * raySY;  // the ray's sideways direction
   Ray &r = rays[rayCount++];
   r.bx = rnd(cx + dx * r0);
   r.by = rnd(cy + dy * r0);
   r.tx = rnd(cx + dx * r1);
   r.ty = rnd(cy + dy * r1);
-  r.px = rnd(-dy * hw0);
-  r.py = rnd(dx * hw0);
-  r.qx = rnd(-dy * hw1);
-  r.qy = rnd(dx * hw1);
+  r.px = rnd(nx * hw0);
+  r.py = rnd(ny * hw0);
+  r.qx = rnd(nx * hw1);
+  r.qy = rnd(ny * hw1);
   r.tipR = tipR;
 }
 
@@ -499,25 +595,73 @@ void drawRays() {
 uint8_t hash8(uint16_t n) { return (uint32_t)(n * 2654435761UL) >> 24; }
 
 // ---------------------------------------------------------------------------
+// Light: the panel can't show colours, but it can change the whole screen's
+// brightness (contrast), and dithering gives 16 shades of grey for glows
+// ---------------------------------------------------------------------------
+const uint8_t CONTRAST_NORMAL = 0xCF;  // U8g2's SH1106 default
+uint8_t claudeContrast = CONTRAST_NORMAL;
+uint8_t sentContrast = CONTRAST_NORMAL;
+
+uint8_t glow(float g) { return 0x18 + clamp01(g) * (0xFF - 0x18); }  // 0..1 -> contrast
+
+// A soft dithered halo round (haloX, haloY): densest at haloR0, gone at haloR1,
+// never more than half lit, so it reads as grey. Worked out in prepareClaude().
+const uint8_t BAYER4[16] PROGMEM = {0, 8, 2, 10, 12, 4, 14, 6, 3, 11, 1, 9, 15, 7, 13, 5};
+int16_t haloX, haloY;
+float haloR0, haloR1, haloLevel;
+
+void drawHalo() {
+  if (haloLevel <= 0) return;
+  int16_t r = haloR1 + 1;
+  for (int16_t y = max(0, haloY - r); y <= min(63, haloY + r); y++)
+    for (int16_t x = max(0, haloX - r); x <= min(127, haloX + r); x++) {
+      float d = sqrt((float)(x - haloX) * (x - haloX) + (float)(y - haloY) * (y - haloY));
+      if (d < haloR0 || d > haloR1) continue;
+      float v = haloLevel * 0.5 * (1 - (d - haloR0) / (haloR1 - haloR0));
+      if (v * 16 > pgm_read_byte(&BAYER4[(y & 3) * 4 + (x & 3)])) display.drawPixel(x, y);
+    }
+}
+
+void setHalo(float x, float y, float r0, float r1, float level) {
+  haloX = rnd(x); haloY = rnd(y); haloR0 = r0; haloR1 = r1; haloLevel = level;
+}
+
+// ---------------------------------------------------------------------------
 // Claude animations (shown while Claude Code is working)
 // ---------------------------------------------------------------------------
-enum ClaudeAnim : uint8_t { SPINNER, WAVE, WRITING, SHIMMER, ASSEMBLE, NUM_CLAUDE_ANIMS };
+enum ClaudeAnim : uint8_t {
+  SPINNER, WAVE, WRITING, SHIMMER, ASSEMBLE,
+  TERMINAL, TYPEWRITER, FLIP, BOUNCE, SCOPE,
+  NUM_CLAUDE_ANIMS
+};
 uint8_t claudeAnim = 0xFF;
 uint8_t claudeSeed;     // picks the verb and the "code" for this run
 char claudeText[14];
+char claudeLine[24];    // TERMINAL's prompt
 uint8_t claudeTextX;
 int16_t shimmerBand;
+long termWork;          // TERMINAL: ms since Claude "started" (negative while the prompt types)
+uint8_t typePhase;      // TYPEWRITER: 0 typing, 1 holding, 2 deleting
+float bounceH;          // BOUNCE: height above the floor, 0..1
+const uint8_t TYPE_X = 26;        // TYPEWRITER: left edge of the word
+const uint8_t BOUNCE_FLOOR = 59;  // BOUNCE: y the spark lands on
 
 // Whimsical verbs, like Claude Code's spinner
 const char VERBS[] PROGMEM =
   "THINKING\0PONDERING\0NOODLING\0CLAUDING\0BREWING\0MUSING\0COGITATING\0CONJURING\0";
 const uint8_t NUM_VERBS = 8;
 
-void loadVerb(uint8_t i, char *out) {
-  const char *p = VERBS;
+// Prompts "typed" into the TERMINAL animation
+const char PROMPTS[] PROGMEM =
+  "add more animations\0fix the oled flicker\0why is wifi so slow?\0refactor pc_link.py\0update the readme\0";
+const uint8_t NUM_PROMPTS = 5;
+
+void loadString(const char *list, uint8_t i, char *out) {
+  const char *p = list;
   while (i--) p += strlen_P(p) + 1;
   strcpy_P(out, p);
 }
+void loadVerb(uint8_t i, char *out) { loadString(VERBS, i, out); }
 
 void startClaudeAnim() {
   uint8_t i;
@@ -532,7 +676,7 @@ const uint8_t SPINNER_PETAL_W[6] PROGMEM = {0, 30, 13, 0, 30, 44};  // petal wid
 
 void addSpinnerGlyph(float cx, float cy, float s, uint8_t k, float rot) {
   if (k == 0) {  // ·
-    addRay(cx, cy, 0, 0, 0, 0, 0, 3);
+    addRay(cx, cy, 0, 0, 0, 0, 0, s > 10 ? 3 : 1);
   } else if (k == 3) {  // ✶ six spikes
     for (uint8_t j = 0; j < 6; j++) addRay(cx, cy, rot + j * 1.0472, 0, s, s * 0.22, 0, 0);
   } else {  // ✢ ✳ ✻ ✽: 4 or 8 leaf-shaped petals, each made of two rays
@@ -549,12 +693,16 @@ void addSpinnerGlyph(float cx, float cy, float s, uint8_t k, float rot) {
 void prepareClaude(long ms) {
   float t = ms / 1000.0;
   rayCount = 0;
+  raySX = raySY = 1;
+  haloLevel = 0;
+  claudeContrast = CONTRAST_NORMAL;
   claudeText[0] = 0;
 
   switch (claudeAnim) {
     case SPINNER: {
       uint8_t k = pgm_read_byte(&SPINNER_SEQ[(ms / 143) % 10]);
       addSpinnerGlyph(64, 25, 21, k, t * 0.8);
+      claudeContrast = glow(0.45 + 0.11 * k);  // the bigger the glyph, the brighter
       loadVerb(claudeSeed % NUM_VERBS, claudeText);
       for (uint8_t d = (ms / 400) % 4; d; d--) strcat_P(claudeText, PSTR("."));
       display.setFont(SMALL_FONT);
@@ -568,6 +716,7 @@ void prepareClaude(long ms) {
         float d = cos(rayAngle(i, 0) - phase);
         addSparkRay(i, 64, 32, 27, t * 0.25, 0.5 + 0.5 * (d > 0 ? d * d * d : 0));
       }
+      claudeContrast = glow(0.7 + 0.3 * sin(t * 2));  // slow breathing
       break;
     }
 
@@ -600,8 +749,83 @@ void prepareClaude(long ms) {
         float len = 26 * rayLength(i);
         addRay(64, 32, rayAngle(i, rot), 1.5 + off, len + off, 2.3, 1.7, 1);
       }
+      // Brightens as the rays gather; a flash and a ring of light when the last
+      // one snaps in (at 1.85 s), and again as they burst out
+      const float snap = 11 * 0.05 + inT;
+      float g = 0.35 + 0.5 * easeOut(clamp01(t / snap));
+      if (t >= snap && t < snap + 0.6) {
+        float f = (t - snap) / 0.6;
+        g = 1 - 0.15 * f;
+        setHalo(64, 32, 14 + f * 30, 28 + f * 30, 1 - f);
+      }
+      if (t >= outT) g = 1 - 0.6 * clamp01((t - outT) / 1.1);
+      claudeContrast = glow(g);
       break;
     }
+
+    case TERMINAL:  // Claude Code's status line; the text is drawn in drawTerminal()
+      loadString(PROMPTS, claudeSeed % NUM_PROMPTS, claudeLine);
+      loadVerb((claudeSeed >> 2) % NUM_VERBS, claudeText);
+      termWork = ms - (long)strlen(claudeLine) * 40 - 250;
+      if (termWork >= 0) addSpinnerGlyph(6, 21, 6, pgm_read_byte(&SPINNER_SEQ[(ms / 120) % 10]), 0);
+      break;
+
+    case TYPEWRITER: {  // verbs type in, hold with a blinking cursor, then backspace
+      display.setFont(MID_FONT);
+      long t0 = 0;
+      uint8_t v = claudeSeed, len = 0;
+      for (uint8_t guard = 0; guard < 40; guard++, v++) {
+        loadVerb(v % NUM_VERBS, claudeText);
+        if (display.getStrWidth(claudeText) > 128 - TYPE_X - 10) continue;  // too wide to fit
+        len = strlen(claudeText);
+        long dur = len * 120L + 900 + 250;  // 85 ms/letter in, 35 ms/letter out, hold, gap
+        if (ms < t0 + dur) break;
+        t0 += dur;
+        v += 2;
+      }
+      long e = ms - t0;
+      uint8_t shown;
+      if (e < len * 85L) { shown = e / 85 + 1; typePhase = 0; }
+      else if (e < len * 85L + 900) { shown = len; typePhase = 1; }
+      else { long gone = (e - len * 85L - 900) / 35 + 1; shown = gone >= len ? 0 : len - gone; typePhase = 2; }
+      claudeText[shown < len ? shown : len] = 0;
+      for (uint8_t i = 0; i < NUM_RAYS; i++)
+        addSparkRay(i, 12, 32, 9, t * 1.2, typePhase == 0 ? 0.8 + 0.2 * sin(t * 25 + i) : 1);
+      if (typePhase == 0 && e % 85 < 30) claudeContrast = 0xFF;  // a blip of light per keystroke
+      break;
+    }
+
+    case FLIP: {  // the spark spins like a tossed coin; shadow and twinkles in drawFlip()
+      float c = cos(t * 2.4);
+      raySX = c < 0 ? min(c, -0.1f) : max(c, 0.1f);  // never quite edge-on, so it doesn't vanish
+      float cy = 27 + sin(t * 4.8) * 1.5;
+      for (uint8_t i = 0; i < NUM_RAYS; i++) addSparkRay(i, 64, cy, 17, 0.2, 1);
+      // Catches the light when it faces you: brighter, with a glint of glow
+      claudeContrast = glow(0.25 + 0.75 * c * c);
+      setHalo(64, cy, 15, 30, pow(fabs(c), 6));
+      break;
+    }
+
+    case BOUNCE: {  // squash on landing, stretch while moving fast
+      const float P = 1.05, R = 12;
+      float p = fmod(t, P) / P, dc = min(p, 1 - p), v = 1 - 2 * p;
+      float k = dc < 0.07 ? 1 - dc / 0.07 : 0;
+      bounceH = 4 * p * (1 - p);
+      raySX = k > 0 ? 1 + 0.38 * k : 1 - 0.1 * v * v;
+      raySY = k > 0 ? 1 - 0.32 * k : 1 + 0.14 * v * v;
+      for (uint8_t i = 0; i < NUM_RAYS; i++)
+        addSparkRay(i, 64, BOUNCE_FLOOR - R * raySY * 0.95 - bounceH * 30, R, t / P * 0.9, 1);
+      // Impact flash: the screen brightens and a glow splashes along the floor
+      claudeContrast = glow(0.6 + 0.4 * k);
+      setHalo(64, BOUNCE_FLOOR, 8, 24, k);
+      break;
+    }
+
+    case SCOPE:  // small spark in the corner; the trace is drawn in drawScope()
+      for (uint8_t i = 0; i < NUM_RAYS; i++) addSparkRay(i, 6, 6, 5, t * 1.6, 1);
+      loadVerb(claudeSeed % NUM_VERBS, claudeText);
+      claudeContrast = glow(0.4 + 0.6 * (0.65 + 0.35 * sin(t * 1.4)));  // follows the signal's strength
+      break;
   }
 }
 
@@ -629,22 +853,134 @@ void drawCodeLines(long ms) {
   display.setMaxClipWindow();
 }
 
-// Dim the shimmer word with a checkerboard, except in the sweeping band.
-// Works straight on the strip buffer, so it costs almost nothing.
-void shimmerMask() {
+// Dim tile rows tile0..tile1 (8 px each) from x0 rightwards with a checkerboard,
+// except inside a bright band at x = band + y * slope5 / 5, halfW wide each side.
+// Works straight on the frame buffer, so it costs almost nothing.
+void dimTiles(uint8_t tile0, uint8_t tile1, uint8_t x0, int16_t band, uint8_t slope5, uint8_t halfW) {
   uint8_t *buf = display.getBufferPtr();
-  uint8_t firstTile = u8g2_GetBufferCurrTileRow(display.getU8g2());
-  for (uint8_t r = 0; r < 2; r++) {  // each strip holds 2 rows of 8 pixels
+  uint8_t firstTile = display.getBufferCurrTileRow(), rows = display.getBufferTileHeight();
+  for (uint8_t r = 0; r < rows; r++) {
     uint8_t tile = firstTile + r;
-    if (tile < 3 || tile > 5) continue;  // only the word's rows (y 24..47)
+    if (tile < tile0 || tile > tile1) continue;
     int16_t yc = tile * 8 + 4;
     uint8_t *row = buf + r * 128;
-    for (uint8_t x = 0; x < 128; x++)
-      if (abs(x - yc * 2 / 5 - shimmerBand) > 9) row[x] &= (x & 1) ? 0x55 : 0xAA;
+    for (uint8_t x = x0; x < 128; x++)
+      if (abs(x - yc * slope5 / 5 - band) > halfW) row[x] &= (x & 1) ? 0x55 : 0xAA;
   }
 }
 
+// Claude Code's status line: prompt, spinner + shimmering verb, seconds and tokens
+void drawTerminal(long ms) {
+  display.setFont(SMALL_FONT);
+  display.setFontPosTop();
+  uint8_t len = strlen(claudeLine), typed = ms / 40 < len ? ms / 40 : len;
+  char shown[24];
+  memcpy(shown, claudeLine, typed);
+  shown[typed] = 0;
+  display.drawStr(0, 0, ">");
+  display.drawStr(8, 0, shown);
+  if (typed < len) display.drawBox(8 + display.getStrWidth(shown) + 1, 0, 4, 7);
+
+  for (uint8_t x = 0; x < 128; x += 2) display.drawPixel(x, 44);
+  display.drawStr(0, 47, ">");
+  if ((ms / 500) % 2) display.drawBox(8, 47, 4, 7);
+  display.drawStr(0, 56, "esc to interrupt");
+  dimTiles(7, 7, 0, -1000, 0, 0);  // grey hint text
+
+  if (termWork >= 0) {
+    char buf[20];
+    snprintf(buf, sizeof(buf), "(%us ", (unsigned)(2 + claudeSeed % 30 + termWork / 1000));
+    display.drawStr(14, 34, buf);
+    uint8_t x = 14 + display.getStrWidth(buf);
+    display.drawVLine(x + 2, 34, 6);  // down arrow
+    display.drawLine(x, 37, x + 2, 39);
+    display.drawLine(x + 4, 37, x + 2, 39);
+    unsigned tok = 150 + claudeSeed * 9 + termWork * 42 / 100;
+    if (tok >= 1000) snprintf(buf, sizeof(buf), "%u.%uk tokens)", tok / 1000, tok % 1000 / 100);
+    else snprintf(buf, sizeof(buf), "%u tokens)", tok);
+    display.drawStr(x + 7, 34, buf);
+
+    display.setFontPosBaseline();
+    display.setFont(MID_FONT);
+    display.drawStr(14, 30, claudeText);
+    uint8_t w = display.getStrWidth(claudeText);
+    if (14 + w + 13 < 128)
+      for (uint8_t i = 0; i < 3; i++) display.drawBox(14 + w + 3 + i * 4, 29, 2, 2);  // "..."
+    dimTiles(1, 3, 14, -12 + (termWork % 1500) * 130 / 1500, 0, 7);
+  }
+  display.setFontPosBaseline();
+}
+
+// Spinning spark's shadow, plus little stars twinkling around it
+void drawFlip(long ms) {
+  float t = ms / 1000.0, rx = 4 + 14 * fabs(cos(t * 2.4)), ry = 2.5;
+  for (int8_t y = 55; y <= 61; y++)
+    for (int16_t x = 64 - rx; x <= 64 + rx; x++) {
+      float u = (x - 64) / rx, v = (y - 58) / ry;
+      if (u * u + v * v <= 1 && ((x + y) & 1) == 0) display.drawPixel(x, y);
+    }
+  for (uint8_t s = 0; s < 6; s++) {
+    int16_t x = 8 + hash8(claudeSeed + s * 11) * 112 / 255;
+    int16_t y = 6 + hash8(claudeSeed + s * 11 + 5) * 40 / 255;
+    if (abs(x - 64) < 26) x += x < 64 ? -26 : 26;
+    float q = fmod(t * 1.3 + hash8(claudeSeed + s * 11 + 9) / 255.0, 1);
+    int8_t sz = q < 0.4 ? rnd(sin(q / 0.4 * PI) * 3) : 0;
+    if (sz > 0) {
+      display.drawHLine(x - sz, y, sz * 2 + 1);
+      display.drawVLine(x, y - sz, sz * 2 + 1);
+    }
+  }
+}
+
+// Floor, a shadow that shrinks as the spark rises, and dust when it lands
+void drawBounce(long ms) {
+  float t = ms / 1000.0, age = fmod(t, 1.05);
+  for (uint8_t x = 16; x < 112; x += 3) display.drawPixel(x, BOUNCE_FLOOR + 1);
+  float rx = 5 + 11 * (1 - bounceH), ry = 1.6;
+  for (int8_t y = 61; y <= 63; y++)
+    for (int16_t x = 64 - rx; x <= 64 + rx; x++) {
+      float u = (x - 64) / rx, v = (y - 62) / ry;
+      if (u * u + v * v <= 1 && ((x + y) & 1) == 0) display.drawPixel(x, y);
+    }
+  if (age < 0.25)
+    for (int8_t d = -1; d <= 1; d += 2)
+      for (uint8_t j = 0; j < 3; j++)
+        display.drawPixel(64 + d * (14 + age * 60 + j * 4), BOUNCE_FLOOR - age * 20 * (1 - age * 3) - j);
+}
+
+// Oscilloscope: graticule, a "brainwave" trace with a sweeping beam, frequency readout
+float scopeY(float x, float t, float env) {
+  return 38 + env * (9 * sin(x * 0.085 - t * 5.2) + 4 * sin(x * 0.21 + t * 3.3)) + 1.5 * sin(x * 0.63 - t * 11);
+}
+
+void drawScope(long ms) {
+  float t = ms / 1000.0;
+  display.setFont(SMALL_FONT);
+  display.setFontPosTop();
+  display.drawStr(14, 2, claudeText);
+  char buf[10];
+  snprintf(buf, sizeof(buf), "%.2fkHz", 1.8 + claudeSeed / 255.0 * 1.4 + 0.3 * sin(t * 0.9));
+  display.drawStr(127 - display.getStrWidth(buf), 2, buf);
+  display.setFontPosBaseline();
+
+  for (uint8_t gx = 0; gx < 128; gx += 16)
+    for (uint8_t gy = 14; gy < 64; gy += 3) display.drawPixel(gx, gy);
+  for (uint8_t x = 0; x < 128; x += 4) display.drawPixel(x, 38);
+
+  float env = 0.65 + 0.35 * sin(t * 1.4);
+  int16_t sweep = (long)(t * 95) % 140;  // the beam; older trace to its right is dotted
+  int16_t prev = scopeY(0, t, env);
+  for (uint8_t x = 1; x < 128; x++) {
+    int16_t y = scopeY(x, t, env);
+    if (x <= sweep) display.drawLine(x - 1, prev, x, y);
+    else if (x % 3 == 0) display.drawPixel(x, y);
+    prev = y;
+  }
+  if (sweep < 128) display.drawDisc(sweep, scopeY(sweep, t, env), 1);
+}
+
 void drawClaude(long ms) {
+  drawHalo();
   drawRays();
   switch (claudeAnim) {
     case SPINNER:
@@ -663,7 +999,26 @@ void drawClaude(long ms) {
     case SHIMMER:
       display.setFont(MID_FONT);
       display.drawStr(claudeTextX, 44, claudeText);
-      shimmerMask();
+      dimTiles(3, 5, 0, shimmerBand, 2, 9);  // the word's rows, y 24..47
+      break;
+    case TERMINAL:
+      drawTerminal(ms);
+      break;
+    case TYPEWRITER: {
+      display.setFont(MID_FONT);
+      display.drawStr(TYPE_X, 40, claudeText);
+      if (typePhase != 1 || (ms / 300) % 2 == 0)
+        display.drawBox(TYPE_X + display.getStrWidth(claudeText) + 2, 24, 6, 17);
+      break;
+    }
+    case FLIP:
+      drawFlip(ms);
+      break;
+    case BOUNCE:
+      drawBounce(ms);
+      break;
+    case SCOPE:
+      drawScope(ms);
       break;
   }
 }
@@ -838,13 +1193,11 @@ void update() {
       break;
   }
 
-  // Work out this frame's picture once, so render() only has to draw it
   if (page == PG_CLOCK) prepareClock();
   else if (page == PG_CLAUDE) prepareClaude(pt);
   else if (page == PG_USAGE) prepareUsage(pt);
 }
 
-// Draw the current frame: called once for each strip of the screen
 void render() {
   switch (page) {
     case PG_CLOCK: drawClock(); break;
@@ -853,9 +1206,14 @@ void render() {
     case PG_EYES:
       drawEyes(eyesClosing ? NORMAL : key.style);
       if (!synced) {
+        // Before the first time sync, show the WiFi state (and IP, to check the PC can reach it)
+        char msg[28];
+        if (WiFi.status() == WL_CONNECTED)
+          snprintf(msg, sizeof(msg), "waiting @ %s", WiFi.localIP().toString().c_str());
+        else
+          snprintf(msg, sizeof(msg), "connecting to WiFi...");
         display.setFont(SMALL_FONT);
-        display.setCursor(14, 63);
-        display.print(F("waiting for PC time"));
+        display.drawStr((128 - display.getStrWidth(msg)) / 2, 63, msg);
       }
       break;
   }
@@ -868,7 +1226,8 @@ void render() {
 
 void setup() {
   Serial.begin(115200);
-  randomSeed(analogRead(A0));
+  randomSeed(esp_random());
+  startWifi();
 
   // Most modules use address 0x3C. U8g2 expects the 8-bit form (0x3C << 1).
   display.setI2CAddress(0x3C << 1);
@@ -881,10 +1240,16 @@ void setup() {
 }
 
 void loop() {
-  readSerial();
+  readMessages();
   frameNow = millis();
 
   update();
+  // Claude animations drive the screen's brightness; every other page uses the normal level
+  uint8_t contrast = page == PG_CLAUDE && trans == T_NONE ? claudeContrast : CONTRAST_NORMAL;
+  if (contrast != sentContrast) {
+    display.setContrast(contrast);
+    sentContrast = contrast;
+  }
   display.firstPage();
   do {
     render();
